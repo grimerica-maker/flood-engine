@@ -5,6 +5,7 @@ from PIL import Image
 import io
 import os
 import requests
+import math
 
 app = FastAPI()
 
@@ -19,33 +20,61 @@ app.add_middleware(
 MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN")
 TILE_SIZE = 256
 
+
 def decode_terrain_rgb(r: int, g: int, b: int) -> float:
     return -10000 + ((r * 256 * 256 + g * 256 + b) * 0.1)
+
+
+def lnglat_to_tile(lng: float, lat: float, z: int):
+    lat_rad = math.radians(lat)
+    n = 2.0 ** z
+    xtile = (lng + 180.0) / 360.0 * n
+    ytile = ((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0) * n
+    return xtile, ytile
+
 
 @app.get("/")
 def root():
     return {"status": "flood engine running"}
 
+
 @app.get("/elevation")
 def elevation(lat: float, lng: float):
-    # Temporary simple ocean/land approximation so cursor updates reliably.
-    # This is NOT true bathymetry yet.
-    if abs(lat) < 70:
-        if -170 <= lng <= 170:
-            if lat > 0:
-                approx = -2000
-            else:
-                approx = -1500
-        else:
-            approx = -3000
-    else:
-        approx = -500
+    if not MAPBOX_TOKEN:
+        raise HTTPException(status_code=500, detail="Missing MAPBOX_TOKEN")
+
+    z = 14
+    xtile_f, ytile_f = lnglat_to_tile(lng, lat, z)
+
+    x = int(xtile_f)
+    y = int(ytile_f)
+
+    px = int((xtile_f - x) * TILE_SIZE)
+    py = int((ytile_f - y) * TILE_SIZE)
+
+    terrain_url = (
+        f"https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
+        f"?access_token={MAPBOX_TOKEN}"
+    )
+
+    resp = requests.get(terrain_url, timeout=20)
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not fetch terrain tile: {resp.status_code}"
+        )
+
+    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+
+    r, g, b = img.getpixel((px, py))
+    elev = decode_terrain_rgb(r, g, b)
 
     return {
         "lat": lat,
         "lng": lng,
-        "elevation_m": approx
+        "elevation_m": round(elev, 2)
     }
+
 
 @app.get("/flood/{level}/{z}/{x}/{y}.png")
 def flood_tile(level: int, z: int, x: int, y: int):
@@ -75,7 +104,7 @@ def flood_tile(level: int, z: int, x: int, y: int):
             r, g, b = terrain_pixels[px, py]
             elev = decode_terrain_rgb(r, g, b)
 
-            # Positive = flood
+            # Positive sea level = flooding
             if level > 0:
                 if elev <= level:
                     depth = level - elev
@@ -93,7 +122,7 @@ def flood_tile(level: int, z: int, x: int, y: int):
 
                     out_pixels[px, py] = color
 
-            # Negative = drain / exposed shelf
+            # Negative sea level = drained ocean / exposed shelf
             elif level < 0:
                 if level <= elev <= 0:
                     exposed = elev - level
