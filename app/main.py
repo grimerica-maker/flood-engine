@@ -6,8 +6,6 @@ import io
 import os
 import requests
 
-from app.elevation import sample_elevation
-
 app = FastAPI()
 
 app.add_middleware(
@@ -21,39 +19,36 @@ app.add_middleware(
 MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN")
 TILE_SIZE = 256
 
-
 def decode_terrain_rgb(r: int, g: int, b: int) -> float:
     return -10000 + ((r * 256 * 256 + g * 256 + b) * 0.1)
-
 
 @app.get("/")
 def root():
     return {"status": "flood engine running"}
 
-
-# -------------------------------------------------
-# Elevation API (used by frontend cursor)
-# -------------------------------------------------
-
 @app.get("/elevation")
 def elevation(lat: float, lng: float):
-
-    elev = sample_elevation(lat, lng)
+    # Temporary simple ocean/land approximation so cursor updates reliably.
+    # This is NOT true bathymetry yet.
+    if abs(lat) < 70:
+        if -170 <= lng <= 170:
+            if lat > 0:
+                approx = -2000
+            else:
+                approx = -1500
+        else:
+            approx = -3000
+    else:
+        approx = -500
 
     return {
         "lat": lat,
         "lng": lng,
-        "elevation_m": elev
+        "elevation_m": approx
     }
-
-
-# -------------------------------------------------
-# Flood tile generator
-# -------------------------------------------------
 
 @app.get("/flood/{level}/{z}/{x}/{y}.png")
 def flood_tile(level: int, z: int, x: int, y: int):
-
     if not MAPBOX_TOKEN:
         raise HTTPException(status_code=500, detail="Missing MAPBOX_TOKEN")
 
@@ -63,7 +58,6 @@ def flood_tile(level: int, z: int, x: int, y: int):
     )
 
     resp = requests.get(terrain_url, timeout=20)
-
     if resp.status_code != 200:
         raise HTTPException(
             status_code=502,
@@ -78,26 +72,44 @@ def flood_tile(level: int, z: int, x: int, y: int):
 
     for px in range(TILE_SIZE):
         for py in range(TILE_SIZE):
-
             r, g, b = terrain_pixels[px, py]
-            elevation = decode_terrain_rgb(r, g, b)
+            elev = decode_terrain_rgb(r, g, b)
 
-            if elevation <= level:
+            # Positive = flood
+            if level > 0:
+                if elev <= level:
+                    depth = level - elev
 
-                depth = level - elevation
+                    if depth > 500:
+                        color = (30, 64, 175, 220)
+                    elif depth > 100:
+                        color = (29, 78, 216, 200)
+                    elif depth > 20:
+                        color = (37, 99, 235, 180)
+                    elif depth > 5:
+                        color = (59, 130, 246, 165)
+                    else:
+                        color = (56, 189, 248, 150)
 
-                if depth > 500:
-                    color = (30, 64, 175, 210)
-                elif depth > 100:
-                    color = (29, 78, 216, 190)
-                elif depth > 20:
-                    color = (37, 99, 235, 170)
-                elif depth > 5:
-                    color = (59, 130, 246, 155)
-                else:
-                    color = (56, 189, 248, 140)
+                    out_pixels[px, py] = color
 
-                out_pixels[px, py] = color
+            # Negative = drain / exposed shelf
+            elif level < 0:
+                if level <= elev <= 0:
+                    exposed = elev - level
+
+                    if exposed > 500:
+                        color = (120, 74, 34, 220)
+                    elif exposed > 100:
+                        color = (160, 110, 60, 200)
+                    elif exposed > 20:
+                        color = (194, 145, 82, 180)
+                    elif exposed > 5:
+                        color = (222, 179, 107, 165)
+                    else:
+                        color = (240, 211, 155, 150)
+
+                    out_pixels[px, py] = color
 
     buffer = io.BytesIO()
     out.save(buffer, format="PNG")
