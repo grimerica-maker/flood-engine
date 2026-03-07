@@ -29,7 +29,7 @@ def root():
 @app.get("/flood/{level}/{z}/{x}/{y}.png")
 def flood_tile(level: int, z: int, x: int, y: int):
     if not MAPBOX_TOKEN:
-        raise HTTPException(status_code=500, detail="Missing MAPBOX_TOKEN")
+      raise HTTPException(status_code=500, detail="Missing MAPBOX_TOKEN")
 
     terrain_url = (
         f"https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
@@ -76,5 +76,5 @@ def flood_tile(level: int, z: int, x: int, y: int):
     return Response(
         content=buffer.getvalue(),
         media_type="image/png",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={"Cache-Control": "no-store"},
     )
