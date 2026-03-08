@@ -37,10 +37,8 @@ def lnglat_to_tile(lng: float, lat: float, z: int):
 def pixel_to_lnglat(z: int, x: int, y: int, px: int, py: int):
     n = 2.0 ** z
     lng = ((x + (px / TILE_SIZE)) / n) * 360.0 - 180.0
-
     merc_y = math.pi * (1 - 2 * (y + (py / TILE_SIZE)) / n)
     lat = math.degrees(math.atan(math.sinh(merc_y)))
-
     return lng, lat
 
 
@@ -66,7 +64,7 @@ def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 
 def fetch_terrain_tile(z: int, x: int, y: int) -> Image.Image:
     if not MAPBOX_TOKEN:
-      raise HTTPException(status_code=500, detail="Missing MAPBOX_TOKEN")
+        raise HTTPException(status_code=500, detail="Missing MAPBOX_TOKEN")
 
     terrain_url = (
         f"https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
@@ -98,26 +96,6 @@ def get_elevation_at_latlng(lat: float, lng: float, z: int = 14) -> float:
     img = fetch_terrain_tile(z, x, y)
     r, g, b = img.getpixel((px, py))
     return decode_terrain_rgb(r, g, b)
-
-
-def estimate_initial_wave_m(diameter_m: float) -> float:
-    return diameter_m * 8.0
-
-
-def estimate_decay_distance_m(diameter_m: float) -> float:
-    return max(50000.0, diameter_m * 1200.0)
-
-
-def estimate_wave_height_m(distance_m: float, diameter_m: float) -> float:
-    initial_wave_m = estimate_initial_wave_m(diameter_m)
-    decay_distance_m = estimate_decay_distance_m(diameter_m)
-
-    wave_height = initial_wave_m * math.exp(-distance_m / decay_distance_m)
-
-    if wave_height < 0.5:
-        return 0.0
-
-    return wave_height
 
 
 def build_empty_tile() -> bytes:
@@ -207,7 +185,6 @@ def impact_flood_tile(lat: float, lng: float, diameter: float, z: int, x: int, y
 
     impact_elevation = get_elevation_at_latlng(lat, lng)
 
-    # Land impact: no tsunami flood overlay
     if impact_elevation > 0:
         return Response(
             content=build_empty_tile(),
@@ -221,27 +198,26 @@ def impact_flood_tile(lat: float, lng: float, diameter: float, z: int, x: int, y
     out = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
     out_pixels = out.load()
 
+    initial_wave_m = diameter * 12.0
+    decay_distance_m = max(150000.0, diameter * 2500.0)
+
     for px in range(TILE_SIZE):
         for py in range(TILE_SIZE):
             sample_lng, sample_lat = pixel_to_lnglat(z, x, y, px, py)
             distance_m = haversine_m(lat, lng, sample_lat, sample_lng)
-            wave_height_m = estimate_wave_height_m(distance_m, diameter)
 
-            if wave_height_m <= 0:
+            wave_height_m = initial_wave_m * math.exp(-distance_m / decay_distance_m)
+            if wave_height_m < 1.0:
                 continue
 
             r, g, b = terrain_pixels[px, py]
             elev = decode_terrain_rgb(r, g, b)
 
-            # Only show inundation where wave height overtops terrain,
-            # and avoid coloring deep open ocean as "flooded land".
-            if elev > wave_height_m:
+            # Skip deeper open ocean so the overlay reads as coastal inundation
+            if elev < -20:
                 continue
 
-            if elev < -200:
-                continue
-
-            depth = wave_height_m - elev
+            depth = wave_height_m - max(elev, 0)
 
             if depth <= 0:
                 continue
@@ -249,13 +225,13 @@ def impact_flood_tile(lat: float, lng: float, diameter: float, z: int, x: int, y
             if depth > 200:
                 color = (8, 47, 73, 220)
             elif depth > 50:
-                color = (3, 105, 161, 200)
+                color = (3, 105, 161, 205)
             elif depth > 10:
-                color = (2, 132, 199, 180)
+                color = (2, 132, 199, 190)
             elif depth > 2:
-                color = (56, 189, 248, 165)
+                color = (56, 189, 248, 175)
             else:
-                color = (125, 211, 252, 145)
+                color = (125, 211, 252, 155)
 
             out_pixels[px, py] = color
 
