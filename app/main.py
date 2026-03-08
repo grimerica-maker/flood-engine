@@ -117,7 +117,7 @@ def elevation(lat: float, lng: float):
     return {
         "lat": lat,
         "lng": lng,
-        "elevation_m": round(elev, 2)
+        "elevation_m": round(elev, 2),
     }
 
 
@@ -179,18 +179,16 @@ def flood_tile(level: int, z: int, x: int, y: int):
 
 
 @app.get("/impact-flood/{lat}/{lng}/{diameter}/{z}/{x}/{y}.png")
-def impact_flood_tile(lat: float, lng: float, diameter: float, z: int, x: int, y: int):
+def impact_flood_tile(
+    lat: float,
+    lng: float,
+    diameter: float,
+    z: int,
+    x: int,
+    y: int,
+):
     if diameter <= 0:
         raise HTTPException(status_code=400, detail="diameter must be > 0")
-
-    impact_elevation = get_elevation_at_latlng(lat, lng)
-
-    if impact_elevation > 0:
-        return Response(
-            content=build_empty_tile(),
-            media_type="image/png",
-            headers={"Cache-Control": "no-store"},
-        )
 
     terrain_img = fetch_terrain_tile(z, x, y)
     terrain_pixels = terrain_img.load()
@@ -198,42 +196,82 @@ def impact_flood_tile(lat: float, lng: float, diameter: float, z: int, x: int, y
     out = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
     out_pixels = out.load()
 
-    initial_wave_m = diameter * 12.0
-    decay_distance_m = max(150000.0, diameter * 2500.0)
+    crater_radius_m = max(500.0, diameter * 40.0)
+    wave_radius_m = max(20000.0, diameter * 1200.0)
+    inundation_radius_m = max(15000.0, diameter * 900.0)
+
+    impact_elevation = get_elevation_at_latlng(lat, lng)
 
     for px in range(TILE_SIZE):
         for py in range(TILE_SIZE):
             sample_lng, sample_lat = pixel_to_lnglat(z, x, y, px, py)
             distance_m = haversine_m(lat, lng, sample_lat, sample_lng)
 
-            wave_height_m = initial_wave_m * math.exp(-distance_m / decay_distance_m)
-            if wave_height_m < 1.0:
-                continue
-
             r, g, b = terrain_pixels[px, py]
             elev = decode_terrain_rgb(r, g, b)
 
-            # Skip deeper open ocean so the overlay reads as coastal inundation
-            if elev < -20:
+            # Crater / blast core
+            if distance_m <= crater_radius_m:
+                if elev >= -50:
+                    out_pixels[px, py] = (127, 29, 29, 210)
+                else:
+                    out_pixels[px, py] = (153, 27, 27, 180)
                 continue
 
-            depth = wave_height_m - max(elev, 0)
-
-            if depth <= 0:
+            # Ocean tsunami field
+            if elev < 0 and distance_m <= wave_radius_m:
+                strength = 1.0 - (distance_m / wave_radius_m)
+                alpha = int(40 + strength * 140)
+                out_pixels[px, py] = (14, 116, 144, alpha)
                 continue
 
-            if depth > 200:
-                color = (8, 47, 73, 220)
-            elif depth > 50:
-                color = (3, 105, 161, 205)
-            elif depth > 10:
-                color = (2, 132, 199, 190)
-            elif depth > 2:
-                color = (56, 189, 248, 175)
-            else:
-                color = (125, 211, 252, 155)
+            # Coastal inundation on land / shallow coast
+            if distance_m <= inundation_radius_m and elev >= -10:
+                wave_height_m = (diameter * 10.0) * (
+                    1.0 - (distance_m / inundation_radius_m)
+                )
 
-            out_pixels[px, py] = color
+                if wave_height_m <= 0:
+                    continue
+
+                depth = wave_height_m - max(elev, 0)
+
+                if depth <= 0:
+                    continue
+
+                if depth > 200:
+                    color = (8, 47, 73, 220)
+                elif depth > 50:
+                    color = (3, 105, 161, 210)
+                elif depth > 10:
+                    color = (2, 132, 199, 195)
+                elif depth > 2:
+                    color = (56, 189, 248, 180)
+                else:
+                    color = (125, 211, 252, 160)
+
+                out_pixels[px, py] = color
+
+    # If land impact, suppress open-ocean tsunami field but still allow crater core.
+    if impact_elevation > 0:
+        land_out = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
+        land_pixels = land_out.load()
+
+        for px in range(TILE_SIZE):
+            for py in range(TILE_SIZE):
+                sample_lng, sample_lat = pixel_to_lnglat(z, x, y, px, py)
+                distance_m = haversine_m(lat, lng, sample_lat, sample_lng)
+
+                r, g, b = terrain_pixels[px, py]
+                elev = decode_terrain_rgb(r, g, b)
+
+                if distance_m <= crater_radius_m:
+                    if elev >= -50:
+                        land_pixels[px, py] = (127, 29, 29, 210)
+                    else:
+                        land_pixels[px, py] = (153, 27, 27, 180)
+
+        out = land_out
 
     buffer = io.BytesIO()
     out.save(buffer, format="PNG")
