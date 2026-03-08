@@ -26,6 +26,7 @@ def decode_terrain_rgb(r: int, g: int, b: int) -> float:
 
 
 def lnglat_to_tile(lng: float, lat: float, z: int):
+    lat = max(min(lat, 85.05112878), -85.05112878)
     lat_rad = math.radians(lat)
     n = 2.0 ** z
     xtile = (lng + 180.0) / 360.0 * n
@@ -33,24 +34,39 @@ def lnglat_to_tile(lng: float, lat: float, z: int):
     return xtile, ytile
 
 
-@app.get("/")
-def root():
-    return {"status": "flood engine running"}
+def pixel_to_lnglat(z: int, x: int, y: int, px: int, py: int):
+    n = 2.0 ** z
+    lng = ((x + (px / TILE_SIZE)) / n) * 360.0 - 180.0
+
+    merc_y = math.pi * (1 - 2 * (y + (py / TILE_SIZE)) / n)
+    lat = math.degrees(math.atan(math.sinh(merc_y)))
+
+    return lng, lat
 
 
-@app.get("/elevation")
-def elevation(lat: float, lng: float):
+def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    earth_radius_m = 6371008.8
+
+    lat1_rad = math.radians(lat1)
+    lng1_rad = math.radians(lng1)
+    lat2_rad = math.radians(lat2)
+    lng2_rad = math.radians(lng2)
+
+    dlat = lat2_rad - lat1_rad
+    dlng = lng2_rad - lng1_rad
+
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlng / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return earth_radius_m * c
+
+
+def fetch_terrain_tile(z: int, x: int, y: int) -> Image.Image:
     if not MAPBOX_TOKEN:
-        raise HTTPException(status_code=500, detail="Missing MAPBOX_TOKEN")
-
-    z = 14
-    xtile_f, ytile_f = lnglat_to_tile(lng, lat, z)
-
-    x = int(xtile_f)
-    y = int(ytile_f)
-
-    px = int((xtile_f - x) * TILE_SIZE)
-    py = int((ytile_f - y) * TILE_SIZE)
+      raise HTTPException(status_code=500, detail="Missing MAPBOX_TOKEN")
 
     terrain_url = (
         f"https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
@@ -64,10 +80,61 @@ def elevation(lat: float, lng: float):
             detail=f"Could not fetch terrain tile: {resp.status_code}"
         )
 
-    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+    return Image.open(io.BytesIO(resp.content)).convert("RGB")
 
+
+def get_elevation_at_latlng(lat: float, lng: float, z: int = 14) -> float:
+    xtile_f, ytile_f = lnglat_to_tile(lng, lat, z)
+
+    x = int(xtile_f)
+    y = int(ytile_f)
+
+    px = int((xtile_f - x) * TILE_SIZE)
+    py = int((ytile_f - y) * TILE_SIZE)
+
+    px = max(0, min(TILE_SIZE - 1, px))
+    py = max(0, min(TILE_SIZE - 1, py))
+
+    img = fetch_terrain_tile(z, x, y)
     r, g, b = img.getpixel((px, py))
-    elev = decode_terrain_rgb(r, g, b)
+    return decode_terrain_rgb(r, g, b)
+
+
+def estimate_initial_wave_m(diameter_m: float) -> float:
+    return diameter_m * 8.0
+
+
+def estimate_decay_distance_m(diameter_m: float) -> float:
+    return max(50000.0, diameter_m * 1200.0)
+
+
+def estimate_wave_height_m(distance_m: float, diameter_m: float) -> float:
+    initial_wave_m = estimate_initial_wave_m(diameter_m)
+    decay_distance_m = estimate_decay_distance_m(diameter_m)
+
+    wave_height = initial_wave_m * math.exp(-distance_m / decay_distance_m)
+
+    if wave_height < 0.5:
+        return 0.0
+
+    return wave_height
+
+
+def build_empty_tile() -> bytes:
+    out = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
+    buffer = io.BytesIO()
+    out.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+@app.get("/")
+def root():
+    return {"status": "flood engine running"}
+
+
+@app.get("/elevation")
+def elevation(lat: float, lng: float):
+    elev = get_elevation_at_latlng(lat, lng)
 
     return {
         "lat": lat,
@@ -78,22 +145,7 @@ def elevation(lat: float, lng: float):
 
 @app.get("/flood/{level}/{z}/{x}/{y}.png")
 def flood_tile(level: int, z: int, x: int, y: int):
-    if not MAPBOX_TOKEN:
-        raise HTTPException(status_code=500, detail="Missing MAPBOX_TOKEN")
-
-    terrain_url = (
-        f"https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw"
-        f"?access_token={MAPBOX_TOKEN}"
-    )
-
-    resp = requests.get(terrain_url, timeout=20)
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not fetch terrain tile: {resp.status_code}"
-        )
-
-    terrain_img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+    terrain_img = fetch_terrain_tile(z, x, y)
     terrain_pixels = terrain_img.load()
 
     out = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
@@ -104,7 +156,6 @@ def flood_tile(level: int, z: int, x: int, y: int):
             r, g, b = terrain_pixels[px, py]
             elev = decode_terrain_rgb(r, g, b)
 
-            # Positive sea level = flooding
             if level > 0:
                 if elev <= level:
                     depth = level - elev
@@ -122,7 +173,6 @@ def flood_tile(level: int, z: int, x: int, y: int):
 
                     out_pixels[px, py] = color
 
-            # Negative sea level = drained ocean / exposed shelf
             elif level < 0:
                 if level <= elev <= 0:
                     exposed = elev - level
@@ -139,6 +189,75 @@ def flood_tile(level: int, z: int, x: int, y: int):
                         color = (240, 211, 155, 150)
 
                     out_pixels[px, py] = color
+
+    buffer = io.BytesIO()
+    out.save(buffer, format="PNG")
+
+    return Response(
+        content=buffer.getvalue(),
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/impact-flood/{lat}/{lng}/{diameter}/{z}/{x}/{y}.png")
+def impact_flood_tile(lat: float, lng: float, diameter: float, z: int, x: int, y: int):
+    if diameter <= 0:
+        raise HTTPException(status_code=400, detail="diameter must be > 0")
+
+    impact_elevation = get_elevation_at_latlng(lat, lng)
+
+    # Land impact: no tsunami flood overlay
+    if impact_elevation > 0:
+        return Response(
+            content=build_empty_tile(),
+            media_type="image/png",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    terrain_img = fetch_terrain_tile(z, x, y)
+    terrain_pixels = terrain_img.load()
+
+    out = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
+    out_pixels = out.load()
+
+    for px in range(TILE_SIZE):
+        for py in range(TILE_SIZE):
+            sample_lng, sample_lat = pixel_to_lnglat(z, x, y, px, py)
+            distance_m = haversine_m(lat, lng, sample_lat, sample_lng)
+            wave_height_m = estimate_wave_height_m(distance_m, diameter)
+
+            if wave_height_m <= 0:
+                continue
+
+            r, g, b = terrain_pixels[px, py]
+            elev = decode_terrain_rgb(r, g, b)
+
+            # Only show inundation where wave height overtops terrain,
+            # and avoid coloring deep open ocean as "flooded land".
+            if elev > wave_height_m:
+                continue
+
+            if elev < -200:
+                continue
+
+            depth = wave_height_m - elev
+
+            if depth <= 0:
+                continue
+
+            if depth > 200:
+                color = (8, 47, 73, 220)
+            elif depth > 50:
+                color = (3, 105, 161, 200)
+            elif depth > 10:
+                color = (2, 132, 199, 180)
+            elif depth > 2:
+                color = (56, 189, 248, 165)
+            else:
+                color = (125, 211, 252, 145)
+
+            out_pixels[px, py] = color
 
     buffer = io.BytesIO()
     out.save(buffer, format="PNG")
