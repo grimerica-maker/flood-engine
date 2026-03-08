@@ -210,7 +210,6 @@ def impact_flood_tile(
             r, g, b = terrain_pixels[px, py]
             elev = decode_terrain_rgb(r, g, b)
 
-            # Crater / blast core
             if distance_m <= crater_radius_m:
                 if elev >= -50:
                     out_pixels[px, py] = (127, 29, 29, 210)
@@ -218,14 +217,12 @@ def impact_flood_tile(
                     out_pixels[px, py] = (153, 27, 27, 180)
                 continue
 
-            # Ocean tsunami field
             if elev < 0 and distance_m <= wave_radius_m:
                 strength = 1.0 - (distance_m / wave_radius_m)
                 alpha = int(40 + strength * 140)
                 out_pixels[px, py] = (14, 116, 144, alpha)
                 continue
 
-            # Coastal inundation on land / shallow coast
             if distance_m <= inundation_radius_m and elev >= -10:
                 wave_height_m = (diameter * 10.0) * (
                     1.0 - (distance_m / inundation_radius_m)
@@ -252,7 +249,6 @@ def impact_flood_tile(
 
                 out_pixels[px, py] = color
 
-    # If land impact, suppress open-ocean tsunami field but still allow crater core.
     if impact_elevation > 0:
         land_out = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
         land_pixels = land_out.load()
